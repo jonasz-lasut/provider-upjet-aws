@@ -65,4 +65,8 @@ func Configure(p *config.Provider) { //nolint:gocyclo
 			TerraformName: "aws_subnet",
 		}
 	})
+
+	p.AddResourceConfigurator("aws_docdb_cluster_parameter_group", func(r *config.Resource) {
+		r.TerraformCustomDiff = common.RemoveApplyMethodOnlyParameterDiffs
+	})
 }

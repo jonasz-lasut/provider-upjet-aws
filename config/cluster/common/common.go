@@ -6,6 +6,7 @@ package common
 
 import (
 	"context"
+	"strings"
 
 	"github.com/crossplane/crossplane-runtime/v2/pkg/fieldpath"
 	"github.com/crossplane/crossplane-runtime/v2/pkg/meta"
@@ -170,4 +171,97 @@ func RemoveDiffIfEmpty(keys []string) config.CustomDiff { //nolint:gocyclo // Th
 
 		return diff, nil
 	}
+}
+
+// RemoveApplyMethodOnlyParameterDiffs removes diffs on the "parameter" set of
+// the RDS, DocDB and Neptune parameter group resources when the only change to
+// a parameter is its apply_method. AWS ignores ApplyMethod in
+// Modify*ParameterGroup calls unless ParameterValue actually changes, and keeps
+// reporting the previously recorded method (pending-reboot for parameters at
+// their engine default), so such a diff can never converge and the update loops
+// forever. A parameter update is triggered only by a value change; apply_method
+// is still sent whenever the value changes.
+func RemoveApplyMethodOnlyParameterDiffs(diff *terraform.InstanceDiff, state *terraform.InstanceState, _ *terraform.ResourceConfig) (*terraform.InstanceDiff, error) { //nolint:gocyclo // Splitting the classification and pairing steps would not make this easier to follow.
+	// Skip diff customization on create
+	if state == nil || state.Empty() {
+		return diff, nil
+	}
+	// Skip no diff or destroy diffs
+	if diff == nil || diff.Empty() || diff.Destroy || diff.Attributes == nil {
+		return diff, nil
+	}
+
+	const prefix = "parameter."
+	// Group the flattened set-element diff keys ("parameter.<hash>.<field>")
+	// by element hash.
+	elements := map[string]map[string]*terraform.ResourceAttrDiff{}
+	for k, ad := range diff.Attributes {
+		if ad == nil || !strings.HasPrefix(k, prefix) {
+			continue
+		}
+		hash, field, found := strings.Cut(strings.TrimPrefix(k, prefix), ".")
+		if !found {
+			continue
+		}
+		if elements[hash] == nil {
+			elements[hash] = map[string]*terraform.ResourceAttrDiff{}
+		}
+		elements[hash][field] = ad
+	}
+
+	// A set element never changes in place: its identity is its hash, so a
+	// changed apply_method appears as one element removed from the state and
+	// one added from the desired config. Classify the elements accordingly.
+	type parameter struct {
+		hash        string
+		value       string
+		applyMethod string
+	}
+	removed := map[string][]parameter{}
+	added := map[string][]parameter{}
+	for hash, fields := range elements {
+		name, value, applyMethod := fields["name"], fields["value"], fields["apply_method"]
+		if name == nil || value == nil || applyMethod == nil {
+			continue
+		}
+		switch {
+		case name.NewRemoved && value.NewRemoved && applyMethod.NewRemoved:
+			n := strings.ToLower(name.Old)
+			removed[n] = append(removed[n], parameter{hash: hash, value: value.Old, applyMethod: applyMethod.Old})
+		case name.Old == "" && value.Old == "" && applyMethod.Old == "":
+			n := strings.ToLower(name.New)
+			added[n] = append(added[n], parameter{hash: hash, value: value.New, applyMethod: applyMethod.New})
+		}
+	}
+
+	for name, r := range removed {
+		a := added[name]
+		if len(r) != 1 || len(a) != 1 {
+			continue
+		}
+		if r[0].value != a[0].value || strings.EqualFold(r[0].applyMethod, a[0].applyMethod) {
+			continue
+		}
+		for _, hash := range []string{r[0].hash, a[0].hash} {
+			for field := range elements[hash] {
+				delete(diff.Attributes, prefix+hash+"."+field)
+			}
+		}
+	}
+
+	// Drop a no-op element count diff once no element diffs remain.
+	if count, ok := diff.Attributes[prefix+"#"]; ok && count != nil && count.Old == count.New {
+		remaining := false
+		for k := range diff.Attributes {
+			if strings.HasPrefix(k, prefix) && k != prefix+"#" {
+				remaining = true
+				break
+			}
+		}
+		if !remaining {
+			delete(diff.Attributes, prefix+"#")
+		}
+	}
+
+	return diff, nil
 }

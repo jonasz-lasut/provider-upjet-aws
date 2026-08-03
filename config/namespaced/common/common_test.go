@@ -13,6 +13,7 @@ import (
 	"github.com/crossplane/crossplane-runtime/v2/pkg/resource/fake"
 	"github.com/crossplane/crossplane-runtime/v2/pkg/test"
 	"github.com/google/go-cmp/cmp"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/terraform"
 	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
@@ -497,4 +498,149 @@ func TestPasswordGenerator(t *testing.T) {
 		})
 	}
 
+}
+
+func TestRemoveApplyMethodOnlyParameterDiffs(t *testing.T) {
+	elem := func(hash, name, value, applyMethod string, removed bool) map[string]*terraform.ResourceAttrDiff {
+		m := map[string]*terraform.ResourceAttrDiff{}
+		for field, val := range map[string]string{"name": name, "value": value, "apply_method": applyMethod} {
+			if removed {
+				m["parameter."+hash+"."+field] = &terraform.ResourceAttrDiff{Old: val, NewRemoved: true}
+			} else {
+				m["parameter."+hash+"."+field] = &terraform.ResourceAttrDiff{New: val}
+			}
+		}
+		return m
+	}
+	merge := func(ms ...map[string]*terraform.ResourceAttrDiff) map[string]*terraform.ResourceAttrDiff {
+		out := map[string]*terraform.ResourceAttrDiff{}
+		for _, m := range ms {
+			for k, v := range m {
+				out[k] = v
+			}
+		}
+		return out
+	}
+	state := &terraform.InstanceState{ID: "example"}
+
+	type args struct {
+		diff  *terraform.InstanceDiff
+		state *terraform.InstanceState
+	}
+	type want struct {
+		attributes map[string]*terraform.ResourceAttrDiff
+	}
+	cases := map[string]struct {
+		reason string
+		args   args
+		want   want
+	}{
+		"ApplyMethodOnlyDiffRemoved": {
+			reason: "A parameter whose only change is apply_method must not produce a diff, including the no-op element count.",
+			args: args{
+				diff: &terraform.InstanceDiff{Attributes: merge(
+					elem("111", "rds.force_ssl", "1", "pending-reboot", true),
+					elem("222", "rds.force_ssl", "1", "immediate", false),
+					map[string]*terraform.ResourceAttrDiff{"parameter.#": {Old: "1", New: "1"}},
+				)},
+				state: state,
+			},
+			want: want{attributes: map[string]*terraform.ResourceAttrDiff{}},
+		},
+		"ValueChangeKept": {
+			reason: "A parameter whose value changes must keep its full diff so apply_method is honored on the update.",
+			args: args{
+				diff: &terraform.InstanceDiff{Attributes: merge(
+					elem("111", "rds.force_ssl", "1", "pending-reboot", true),
+					elem("222", "rds.force_ssl", "0", "immediate", false),
+				)},
+				state: state,
+			},
+			want: want{attributes: merge(
+				elem("111", "rds.force_ssl", "1", "pending-reboot", true),
+				elem("222", "rds.force_ssl", "0", "immediate", false),
+			)},
+		},
+		"MixedSetOnlyNoOpPairRemoved": {
+			reason: "Only the apply_method-only pair is removed; a genuine value change and the element count are kept.",
+			args: args{
+				diff: &terraform.InstanceDiff{Attributes: merge(
+					elem("111", "rds.force_ssl", "1", "pending-reboot", true),
+					elem("222", "rds.force_ssl", "1", "immediate", false),
+					elem("333", "log_checkpoints", "1", "pending-reboot", true),
+					elem("444", "log_checkpoints", "0", "immediate", false),
+					map[string]*terraform.ResourceAttrDiff{"parameter.#": {Old: "2", New: "2"}},
+				)},
+				state: state,
+			},
+			want: want{attributes: merge(
+				elem("333", "log_checkpoints", "1", "pending-reboot", true),
+				elem("444", "log_checkpoints", "0", "immediate", false),
+				map[string]*terraform.ResourceAttrDiff{"parameter.#": {Old: "2", New: "2"}},
+			)},
+		},
+		"AddedParameterKept": {
+			reason: "A newly added parameter with no removed counterpart must keep its diff.",
+			args: args{
+				diff: &terraform.InstanceDiff{Attributes: merge(
+					elem("222", "rds.force_ssl", "1", "immediate", false),
+					map[string]*terraform.ResourceAttrDiff{"parameter.#": {Old: "0", New: "1"}},
+				)},
+				state: state,
+			},
+			want: want{attributes: merge(
+				elem("222", "rds.force_ssl", "1", "immediate", false),
+				map[string]*terraform.ResourceAttrDiff{"parameter.#": {Old: "0", New: "1"}},
+			)},
+		},
+		"SameApplyMethodDifferentCaseKept": {
+			reason: "A pair equal in value and case-insensitively equal in apply_method is not the apply_method bug and is left untouched.",
+			args: args{
+				diff: &terraform.InstanceDiff{Attributes: merge(
+					elem("111", "rds.force_ssl", "1", "immediate", true),
+					elem("222", "rds.force_ssl", "1", "IMMEDIATE", false),
+				)},
+				state: state,
+			},
+			want: want{attributes: merge(
+				elem("111", "rds.force_ssl", "1", "immediate", true),
+				elem("222", "rds.force_ssl", "1", "IMMEDIATE", false),
+			)},
+		},
+		"NonParameterDiffUntouched": {
+			reason: "Diffs outside the parameter set are never touched.",
+			args: args{
+				diff: &terraform.InstanceDiff{Attributes: merge(
+					elem("111", "ttl_monitor", "enabled", "pending-reboot", true),
+					elem("222", "ttl_monitor", "enabled", "immediate", false),
+					map[string]*terraform.ResourceAttrDiff{"tags.foo": {Old: "a", New: "b"}},
+				)},
+				state: state,
+			},
+			want: want{attributes: map[string]*terraform.ResourceAttrDiff{"tags.foo": {Old: "a", New: "b"}}},
+		},
+		"CreateSkipped": {
+			reason: "With no state the resource is being created and the diff is returned unmodified.",
+			args: args{
+				diff: &terraform.InstanceDiff{Attributes: merge(
+					elem("222", "rds.force_ssl", "1", "immediate", false),
+				)},
+				state: nil,
+			},
+			want: want{attributes: merge(
+				elem("222", "rds.force_ssl", "1", "immediate", false),
+			)},
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			got, err := RemoveApplyMethodOnlyParameterDiffs(tc.args.diff, tc.args.state, nil)
+			if err != nil {
+				t.Fatalf("\n%s\nRemoveApplyMethodOnlyParameterDiffs(...): unexpected error: %v", tc.reason, err)
+			}
+			if diff := cmp.Diff(tc.want.attributes, got.Attributes); diff != "" {
+				t.Errorf("\n%s\nRemoveApplyMethodOnlyParameterDiffs(...): -want attributes, +got attributes:\n%s", tc.reason, diff)
+			}
+		})
+	}
 }

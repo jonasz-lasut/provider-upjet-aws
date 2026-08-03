@@ -6,6 +6,8 @@ package neptune
 
 import (
 	"github.com/crossplane/upjet/v2/pkg/config"
+
+	"github.com/upbound/provider-aws/v2/config/cluster/common"
 )
 
 // Configure adds configurations for the neptune group
@@ -47,5 +49,11 @@ func Configure(p *config.Provider) { //nolint:gocyclo
 		r.References["db_cluster_identifier"] = config.Reference{
 			TerraformName: "aws_neptune_cluster",
 		}
+	})
+	p.AddResourceConfigurator("aws_neptune_parameter_group", func(r *config.Resource) {
+		r.TerraformCustomDiff = common.RemoveApplyMethodOnlyParameterDiffs
+	})
+	p.AddResourceConfigurator("aws_neptune_cluster_parameter_group", func(r *config.Resource) {
+		r.TerraformCustomDiff = common.RemoveApplyMethodOnlyParameterDiffs
 	})
 }

@@ -255,4 +255,12 @@ func Configure(p *config.Provider) { //nolint:gocyclo
 	p.AddResourceConfigurator("aws_db_cluster_snapshot", func(r *config.Resource) {
 		r.UseAsync = true
 	})
+
+	p.AddResourceConfigurator("aws_db_parameter_group", func(r *config.Resource) {
+		r.TerraformCustomDiff = common.RemoveApplyMethodOnlyParameterDiffs
+	})
+
+	p.AddResourceConfigurator("aws_rds_cluster_parameter_group", func(r *config.Resource) {
+		r.TerraformCustomDiff = common.RemoveApplyMethodOnlyParameterDiffs
+	})
 }
